@@ -3,7 +3,6 @@ name: Build APK
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -15,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history and tags are needed to build the commit list
 
       - uses: actions/setup-java@v4
         with:
@@ -30,21 +31,68 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      # Read versionName from app/build.gradle(.kts), e.g. 0.2
+      - name: Read app version
+        id: version
+        run: |
+          FILE=$(ls app/build.gradle.kts app/build.gradle 2>/dev/null | head -n1)
+          VERSION=$(grep -E 'versionName' "$FILE" | head -n1 | sed -E 's/.*versionName[ =(]*["'\'']([^"'\'']+)["'\''].*/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "versionName not found in $FILE" >&2
+            exit 1
+          fi
+          echo "Version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Only create a release if the tag doesn't exist yet (i.e. after bumping versionName)
+      - name: Check if release already exists
+        id: exists
+        run: |
+          if git rev-parse -q --verify "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Assemble debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Name the APK after the version
+        run: cp app/build/outputs/apk/debug/app-debug.apk "IconRecolor-${{ steps.version.outputs.tag }}.apk"
 
       - uses: actions/upload-artifact@v4
         with:
           name: IconRecolor-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: IconRecolor-${{ steps.version.outputs.tag }}.apk
 
-      - name: Name the APK after the tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: cp app/build/outputs/apk/debug/app-debug.apk "IconRecolor-${GITHUB_REF_NAME}.apk"
+      # Commits since the previous release (or all commits if there is none yet)
+      - name: Build release notes
+        if: github.event_name != 'pull_request' && steps.exists.outputs.exists == 'false'
+        run: |
+          PREV=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          {
+            echo "## What's new in ${{ steps.version.outputs.tag }}"
+            echo
+            if [ -n "$PREV" ]; then
+              echo "Changes since $PREV:"
+              echo
+              git log "$PREV..HEAD" --no-merges --pretty=format:'- %s (`%h`)'
+            else
+              echo "First release. Commits:"
+              echo
+              git log --no-merges --pretty=format:'- %s (`%h`)'
+            fi
+            echo
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
 
-      - name: Attach APK to the GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create GitHub release
+        if: github.event_name != 'pull_request' && steps.exists.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          files: IconRecolor-${{ github.ref_name }}.apk
-          generate_release_notes: true
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+          files: IconRecolor-${{ steps.version.outputs.tag }}.apk
